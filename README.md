@@ -13,6 +13,7 @@ The project is divided into 4 sequential stages, taking raw clinical-style ECGs 
 
 ## 📁 Repository Structure
 
+```text
 ECG-to-TimeSeries/
 │
 ├── data/                      # Place sample inputs/outputs here
