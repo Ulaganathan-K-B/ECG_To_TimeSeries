@@ -1,0 +1,10 @@
+# .gitignore
+__pycache__/
+*.pth
+*.pt
+*.onnx
+data/large_dataset/
+temp_staging_input/
+temp_raw_output/
+*.csv
+.DS_Store
