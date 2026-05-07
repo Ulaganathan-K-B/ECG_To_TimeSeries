@@ -1,0 +1,300 @@
+import os
+import cv2
+import torch
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
+import segmentation_models_pytorch as smp
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import random
+import albumentations as A
+from tqdm import tqdm
+
+# ==========================================
+# 1. CONFIGURATION
+# ==========================================
+CONFIG = {
+    "image_dir": "/kaggle/input/datasets/ulaganathankb/dataset/crops_raw",
+    "mask_dir":  "/kaggle/input/datasets/ulaganathankb/dataset/crops_bw",
+    "epochs": 100,
+    "batch_size": 16,
+    "lr": 0.001,
+    "weight_decay": 5e-3,
+    "image_height": 256,
+    "image_width": 512,
+    "patience": 10,
+    "max_grad_norm": 1.0,
+    "train_split": 0.8,
+    "num_workers": 4,        # Parallel data loading workers
+}
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ==========================================
+# 2. TRAIN / VAL SPLIT LOGIC
+# ==========================================
+print("Loading and splitting dataset...")
+all_images = [f for f in os.listdir(CONFIG["image_dir"]) if f.endswith(('.png', '.jpg', '.jpeg'))]
+
+random.seed(42)
+random.shuffle(all_images)
+all_images = all_images[:20000]
+
+split_idx = int(len(all_images) * CONFIG["train_split"])
+train_files = all_images[:split_idx]
+val_files   = all_images[split_idx:]
+
+print(f"Total images used: {len(all_images)}")
+print(f"Training on:       {len(train_files)} images")
+print(f"Validating on:     {len(val_files)} images")
+
+# ==========================================
+# 3. HELPER: RESIZE & PAD (TOP/BOTTOM ONLY)
+# ==========================================
+def resize_and_pad(img, mask, target_w=512, target_h=256):
+    """
+    Resizes the image so its width exactly matches target_w,
+    then pads (or centre-crops) only the top and bottom to reach target_h.
+    No left/right padding is applied.
+    """
+    old_h, old_w = img.shape[:2]
+
+    # Scale so width == target_w; height follows aspect ratio
+    ratio  = target_w / old_w
+    new_w  = target_w
+    new_h  = int(old_h * ratio)
+
+    img_resized  = cv2.resize(img,  (new_w, new_h), interpolation=cv2.INTER_AREA)
+    mask_resized = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+
+    delta_h = target_h - new_h
+
+    if delta_h > 0:
+        # Image is shorter than target — pad top and bottom only
+        top    = delta_h // 2
+        bottom = delta_h - top
+        img_out  = cv2.copyMakeBorder(img_resized,  top, bottom, 0, 0,
+                                      cv2.BORDER_CONSTANT, value=[255, 255, 255])
+        mask_out = cv2.copyMakeBorder(mask_resized, top, bottom, 0, 0,
+                                      cv2.BORDER_CONSTANT, value=0)
+    elif delta_h < 0:
+        # Image is taller than target — centre-crop vertically
+        start    = (-delta_h) // 2
+        img_out  = img_resized [start:start + target_h, :]
+        mask_out = mask_resized[start:start + target_h, :]
+    else:
+        img_out  = img_resized
+        mask_out = mask_resized
+
+    return img_out, mask_out
+
+# ==========================================
+# 4. DATASET WITH AUGMENTATIONS
+# ==========================================
+class ECGDataset(Dataset):
+    def __init__(self, image_dir, mask_dir, image_files, is_train=False):
+        self.image_dir = image_dir
+        self.mask_dir  = mask_dir
+        self.is_train  = is_train
+        self.images    = image_files
+
+        self.transform = A.Compose([
+            A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0,
+                               rotate_limit=0, border_mode=cv2.BORDER_CONSTANT, p=0.5),
+            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0, p=0.5),
+            A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
+            A.ImageCompression(quality_lower=40, quality_upper=80, p=0.3),
+        ]) if is_train else None
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        name = self.images[idx]
+
+        img  = cv2.imread(os.path.join(self.image_dir, name))
+        img  = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        mask = cv2.imread(os.path.join(self.mask_dir,  name), cv2.IMREAD_GRAYSCALE)
+
+        # Resize + pad (top/bottom only)
+        img, mask = resize_and_pad(img, mask, CONFIG["image_width"], CONFIG["image_height"])
+
+        # Binarise mask — no dilation, keep ground truth as-is
+        mask = (mask > 127).astype(np.float32)
+
+        if self.transform is not None:
+            aug  = self.transform(image=img, mask=mask)
+            img, mask = aug["image"], aug["mask"]
+
+        # HWC → CHW, normalise to [0, 1]
+        img_tensor  = torch.from_numpy(np.transpose(img / 255.0, (2, 0, 1))).float()
+        mask_tensor = torch.from_numpy(mask).unsqueeze(0)
+
+        return img_tensor, mask_tensor
+
+# ---- DataLoaders with parallel workers and pinned memory ----
+_loader_kwargs = dict(
+    batch_size=CONFIG["batch_size"],
+    num_workers=CONFIG["num_workers"],
+    pin_memory=True,                   # Faster host→GPU transfer
+    persistent_workers=CONFIG["num_workers"] > 0,  # Keep workers alive between epochs
+)
+
+train_loader = DataLoader(
+    ECGDataset(CONFIG["image_dir"], CONFIG["mask_dir"], train_files, is_train=True),
+    shuffle=True, **_loader_kwargs,
+)
+val_loader = DataLoader(
+    ECGDataset(CONFIG["image_dir"], CONFIG["mask_dir"], val_files, is_train=False),
+    shuffle=False, **_loader_kwargs,
+)
+
+# ==========================================
+# 5. MODEL & LOSSES
+# ==========================================
+model = smp.Unet(
+    encoder_name="resnet34", encoder_weights="imagenet",
+    in_channels=3, classes=1,
+).to(device)
+
+focal_loss_fn = smp.losses.FocalLoss(smp.losses.BINARY_MODE, alpha=0.9, gamma=2.0)
+dice_loss_fn  = smp.losses.DiceLoss (smp.losses.BINARY_MODE, from_logits=True)
+
+optimizer = torch.optim.AdamW(model.parameters(),
+                               lr=CONFIG["lr"], weight_decay=CONFIG["weight_decay"])
+scheduler = ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
+
+# Mixed-precision scaler (no-op on CPU)
+scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
+
+# ==========================================
+# 6. PRE-TRAINING SANITY CHECK
+# ==========================================
+print("\nGenerating Sanity Check Image for Presentation...")
+sanity_imgs, sanity_masks = next(iter(train_loader))
+
+sanity_img_vis  = sanity_imgs [0].permute(1, 2, 0).cpu().numpy()
+sanity_mask_vis = sanity_masks[0][0].cpu().numpy()
+
+fig, ax = plt.subplots(1, 2, figsize=(10, 5))
+ax[0].imshow(sanity_img_vis);  ax[0].set_title("What the AI Sees (Padded + Distorted)")
+ax[1].imshow(sanity_mask_vis, cmap='gray'); ax[1].set_title("Ground Truth Mask")
+for a in ax: a.axis("off")
+plt.savefig("PPT_Sanity_Check_Augmentations.png", bbox_inches="tight")
+plt.close()
+print("Saved PPT_Sanity_Check_Augmentations.png")
+
+# Save a fixed visualisation batch once so we don't re-iterate the loader every epoch
+vis_imgs_fixed, vis_masks_fixed = next(iter(train_loader))
+
+# ==========================================
+# 7. TRAINING LOOP
+# ==========================================
+history = []
+best_loss = float("inf")
+epochs_without_improvement = 0
+os.makedirs("epoch_outputs", exist_ok=True)
+
+print("\nStarting Training...")
+for epoch in range(CONFIG["epochs"]):
+
+    # ---- TRAIN ----
+    model.train()
+    train_loss = 0.0
+    train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1:03d} [Train]", leave=False)
+
+    for imgs, masks in train_pbar:
+        imgs, masks = imgs.to(device, non_blocking=True), masks.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)   # Slightly faster than zero_grad()
+
+        with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+            outputs = model(imgs)
+            loss = focal_loss_fn(outputs, masks) + dice_loss_fn(outputs, masks)
+
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG["max_grad_norm"])
+        scaler.step(optimizer)
+        scaler.update()
+
+        train_loss += loss.item()
+        train_pbar.set_postfix(loss=loss.item())
+
+    train_loss /= len(train_loader)
+
+    # ---- VALIDATE ----
+    model.eval()
+    val_loss = 0.0
+    val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1:03d} [Val]", leave=False)
+
+    with torch.no_grad():
+        for imgs, masks in val_pbar:
+            imgs, masks = imgs.to(device, non_blocking=True), masks.to(device, non_blocking=True)
+            with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+                outputs = model(imgs)
+                loss = focal_loss_fn(outputs, masks) + dice_loss_fn(outputs, masks)
+            val_loss += loss.item()
+            val_pbar.set_postfix(loss=loss.item())
+
+    val_loss /= len(val_loader)
+    scheduler.step(val_loss)
+
+    print(f"Epoch {epoch+1:03d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+
+    # ---- SAVE BEST & EARLY STOPPING ----
+    if val_loss < best_loss:
+        best_loss = val_loss
+        torch.save(model.state_dict(), "best_model.pth")
+        epochs_without_improvement = 0
+    else:
+        epochs_without_improvement += 1
+
+    history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss})
+
+    # ---- VISUAL OUTPUT (EPOCH 1 + EVERY 5 EPOCHS) ----
+    if (epoch + 1) == 1 or (epoch + 1) % 5 == 0:
+        vis_img  = vis_imgs_fixed [0].to(device)
+        vis_mask = vis_masks_fixed[0][0].cpu().numpy()
+
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+                pred = model(vis_img.unsqueeze(0))
+            pred_mask = (torch.sigmoid(pred) > 0.5).cpu().numpy()[0, 0]
+
+        vis_img_display = vis_img.cpu().permute(1, 2, 0).numpy()
+
+        fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+        ax[0].imshow(vis_img_display);             ax[0].set_title(f"Input (Epoch {epoch+1})")
+        ax[1].imshow(vis_mask,    cmap="gray");    ax[1].set_title("Ground Truth")
+        ax[2].imshow(pred_mask,   cmap="gray");    ax[2].set_title("AI Prediction")
+        for a in ax: a.axis("off")
+        plt.savefig(f"epoch_outputs/PPT_progress_epoch_{epoch+1}.png", bbox_inches="tight")
+        plt.close()
+
+    # ---- EARLY STOPPING ----
+    if epochs_without_improvement >= CONFIG["patience"]:
+        print(f"\nEarly stopping triggered after {CONFIG['patience']} epochs without improvement.")
+        break
+
+# ==========================================
+# 8. POST-TRAINING: SAVE DATA & GENERATE GRAPH
+# ==========================================
+print("\nWrapping up and generating final Presentation Graphics...")
+torch.save(model.state_dict(), "last_model.pth")
+
+df = pd.DataFrame(history)
+df.to_csv("metrics.csv", index=False)
+
+plt.figure(figsize=(10, 6))
+plt.plot(df["epoch"], df["train_loss"], label="Training Loss",   color="blue",   linewidth=2)
+plt.plot(df["epoch"], df["val_loss"],   label="Validation Loss", color="orange", linewidth=2)
+plt.title("AI Learning Curve: Loss vs. Epochs", fontsize=16)
+plt.xlabel("Epoch", fontsize=14)
+plt.ylabel("Combined Loss (Focal + Dice)", fontsize=14)
+plt.legend(fontsize=12)
+plt.grid(True, linestyle="--", alpha=0.7)
+plt.savefig("PPT_Loss_Curve.png", bbox_inches="tight")
+plt.close()
+
+print("\nTraining Complete! You have all the assets needed for your presentation.")
