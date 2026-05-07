@@ -26,7 +26,8 @@ ECG-to-TimeSeries/
 ├── inference_images/          # Sample outputs and loss graphs
 ├── requirements.txt           # Python dependencies
 └── README.md                  # Project documentation
-'''
+'''text
+
 ## 🛠️ Installation & Setup
 
 1. **Clone the repository:**
