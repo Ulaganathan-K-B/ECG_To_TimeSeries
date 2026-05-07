@@ -16,8 +16,8 @@ The project is divided into 4 sequential stages, taking raw clinical-style ECGs 
 ECG-to-TimeSeries/
 │
 ├── data/                      # Sample inputs/outputs here
-├── src/                       # Pipeline Source Code
-│   ├── final_image_generator.ps1
+├── src/                       # Pipeline Source Code│   
+├── final_image_generator.ps1
 │   ├── Crop_Code.txt          # (Python code for Detectron2)
 │   ├── Real_To_B&W_Code.txt   # (Python code for Segmentation)
 │   └── BW_TS_Un_Normalized_Code.txt # (Python code for Time Series)
