@@ -18,10 +18,10 @@ ECG-to-TimeSeries/
 │
 ├── data/                      # Place sample inputs/outputs here
 ├── src/                       # Pipeline Source Code
-│   ├── final_image_generator.ps1
-│   ├── Crop_Code.txt          # (Python code for Detectron2)
-│   ├── Real_To_B&W_Code.txt   # (Python code for Segmentation)
-│   └── BW_TS_Un_Normalized_Code.txt # (Python code for Time Series)
+│   ├── 1_generator_data.ps1
+│   ├── 2_crop_leads.py  # (Python code for Detectron2)
+│   ├── 3_real_to_bw.py  # (Python code for Segmentation)
+│   └── 4_bw_to_ts.py    # (Python code for Time Series)
 │
 ├── inference_images/          # Sample outputs and loss graphs
 ├── requirements.txt           # Python dependencies
