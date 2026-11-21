@@ -6,10 +6,10 @@ This repository contains an end-to-end AI pipeline that takes realistic, un-norm
 
 The project is divided into 4 sequential stages, taking raw clinical-style ECGs and systematically transforming them into actionable data:
 
-1. **Data Generation (`src/final_image_generator.ps1`)**: A PowerShell orchestration script that interfaces with an ECG generator kit to build raw training batches in standard and B&W formats.
-2. **Lead Cropping (`src/Crop_Code.txt`)**: Utilizes an Object Detection model (Detectron2 / Faster R-CNN) to detect bounding boxes for standard ECG leads (I, II, III, aVR, aVL, aVF, V1-V6, rhythm) and crop them automatically.
-3. **Real to B&W Masking (`src/Real_To_B&W_Code.txt`)**: A deep learning segmentation model (using `segmentation_models_pytorch` with Unet/ResNet) that isolates the ECG signal wave from gridlines and background noise, outputting a clean B&W mask.
-4. **Time Series Extraction (`src/BW_TS_Un_Normalized_Code.txt`)**: A PyTorch-based custom model that translates the 2D B&W signal crop into a 1D time-series CSV format, optimized using Cosine Annealing and Huber Loss.
+1. **Data Generation (`src/1_generator_data.ps1`)**: A PowerShell orchestration script that interfaces with an ECG generator kit to build raw training batches in standard and B&W formats.
+2. **Lead Cropping (`src/2_crop_leads.py`)**: Utilizes an Object Detection model (Detectron2 / Faster R-CNN) to detect bounding boxes for standard ECG leads (I, II, III, aVR, aVL, aVF, V1-V6, rhythm) and crop them automatically.
+3. **Real to B&W Masking (`src/3_real_to_bw.py`)**: A deep learning segmentation model (using `segmentation_models_pytorch` with Unet/ResNet) that isolates the ECG signal wave from gridlines and background noise, outputting a clean B&W mask.
+4. **Time Series Extraction (`src/4_bw_to_ts.py`)**: A PyTorch-based custom model that translates the 2D B&W signal crop into a 1D time-series CSV format, optimized using Cosine Annealing and Huber Loss.
 
 ## 📁 Repository Structure
 
